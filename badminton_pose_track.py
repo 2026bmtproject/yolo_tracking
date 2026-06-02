@@ -6,6 +6,7 @@ from typing import Any
 
 import cv2
 import numpy as np
+from progress.bar import ShadyBar
 from ultralytics import YOLO
 
 from court_select import load_outer_corners_from_csv
@@ -36,15 +37,15 @@ MODEL_PATH = "yolo26m-pose.pt"
 
 # "single"：處理 VIDEO_SOURCE 這一支影片。
 # "folder"：處理 INPUT_DIR 裡所有影片。
-RUN_MODE = "single"
+RUN_MODE = "folder"
 
 # single 模式使用。
-VIDEO_SOURCE = Path("test.mp4")
-OUTPUT_PATH = Path("runs/player_only/test.mp4")
+VIDEO_SOURCE = Path("dai.mp4")
+OUTPUT_PATH = Path("single_output/dai_test_conf008.mp4")
 
 # folder 模式使用。
 INPUT_DIR = Path("andersclip")
-OUTPUT_DIR = Path("anders_fina_track")
+OUTPUT_DIR = Path("anderstrack008")
 
 # 輸出模式：
 # "video"：只輸出處理後的影片。
@@ -69,7 +70,7 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".m4v"}
 PROGRESS_BAR_WIDTH = 30
 PROGRESS_UPDATE_FRAMES = 5
 
-CONFIDENCE = 0.15
+CONFIDENCE = 0.08
 IMAGE_SIZE = 1280
 DEVICE = 0
 TRACKER = "badminton_tracker.yaml"
@@ -731,21 +732,30 @@ def video_files(input_dir: Path) -> list[Path]:
     )
 
 
-def print_progress(video_name: str, current_frame: int, total_frames: int) -> None:
+def create_progress_bar(video_name: str, total_frames: int) -> ShadyBar | None:
     if total_frames <= 0:
+        return None
+
+    bar = ShadyBar(
+        video_name,
+        max=total_frames,
+        width=PROGRESS_BAR_WIDTH,
+        suffix="%(percent).2f%% (%(index)d/%(max)d frames)",
+    )
+    return bar
+
+
+def update_progress(
+    progress_bar: ShadyBar | None,
+    video_name: str,
+    current_frame: int,
+) -> None:
+    if progress_bar is None:
         sys.stdout.write(f"\r{video_name}: processed {current_frame} frames")
         sys.stdout.flush()
         return
 
-    progress = min(1.0, current_frame / total_frames)
-    filled_width = int(PROGRESS_BAR_WIDTH * progress)
-    bar = "#" * filled_width + "-" * (PROGRESS_BAR_WIDTH - filled_width)
-    percent = progress * 100
-    sys.stdout.write(
-        f"\r{video_name}: [{bar}] {percent:6.2f}% "
-        f"({current_frame}/{total_frames} frames)"
-    )
-    sys.stdout.flush()
+    progress_bar.next(current_frame - progress_bar.index)
 
 
 def process_video(
@@ -802,6 +812,7 @@ def process_video(
     player_selector = PlayerSelector()
     recovered_frame_count = 0
     processed_frame_count = 0
+    progress_bar = create_progress_bar(video_source.name, total_frames)
 
     try:
         for processed_frame_count, result in enumerate(results, start=1):
@@ -840,11 +851,14 @@ def process_video(
                 or processed_frame_count == total_frames
             )
             if should_update_progress:
-                print_progress(video_source.name, processed_frame_count, total_frames)
+                update_progress(progress_bar, video_source.name, processed_frame_count)
 
         if processed_frame_count:
-            print_progress(video_source.name, processed_frame_count, total_frames)
-            print()
+            update_progress(progress_bar, video_source.name, processed_frame_count)
+            if progress_bar is not None:
+                progress_bar.finish()
+            else:
+                print()
     finally:
         if writer is not None:
             writer.release()

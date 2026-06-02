@@ -43,4 +43,5 @@ runs/
 selected_court.csv
 test.csv
 
+*.csv
 *.mp4
