@@ -1,0 +1,46 @@
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env
+
+# IDE/editor
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python distribution/build
+build/
+dist/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs and databases
+*.log
+*.sqlite3
+*.db
+
+# Model weights and large binaries
+*.pt
+
+# Generated runs / outputs
+runs/
+
+# OneDrive temporary files
+~$*
+
+# Ignore selected CSV outputs (if generated)
+selected_court.csv
+test.csv
+
+*.mp4

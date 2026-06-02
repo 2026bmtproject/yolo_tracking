@@ -40,12 +40,12 @@ OUTPUT_IDX = [
 CORNER_IDXS = [0, 1, 2, 3]  # TL, TR, BL, BR
 
 # Court-space (V, H) coordinates of the four corners in metres
-CORNER_COURT_PTS = np.float32([
+CORNER_COURT_PTS = np.array([
     [V_LINES[0],  H_LINES[0]],   # TL
     [V_LINES[-1], H_LINES[0]],   # TR
     [V_LINES[0],  H_LINES[-1]],  # BL
     [V_LINES[-1], H_LINES[-1]],  # BR
-])
+], dtype=np.float32)
 
 # Lines to draw (pairs of indices into the 16-point output list)
 COURT_DRAW_LINES = [
@@ -82,6 +82,27 @@ def extract_middle_frame(video_path: str) -> np.ndarray:
     return frame
 
 
+def parse_court_point_line(line: str) -> list[float]:
+    parts = [part.strip() for part in line.replace(",", ";").split(";") if part.strip()]
+    if len(parts) < 2:
+        raise ValueError(f"Invalid court point line: {line!r}")
+    return [float(parts[0]), float(parts[1])]
+
+
+def load_court_points_from_csv(csv_path: Path) -> np.ndarray:
+    with csv_path.open("r", encoding="utf-8-sig") as file:
+        points = [parse_court_point_line(line) for line in file if line.strip()]
+
+    if len(points) < 4:
+        raise ValueError(f"{csv_path} must contain at least 4 court points")
+
+    return np.array(points, dtype=np.int32)
+
+
+def load_outer_corners_from_csv(csv_path: Path) -> np.ndarray:
+    return load_court_points_from_csv(csv_path)[:4]
+
+
 def scale_to_fit(img: np.ndarray, max_w: int, max_h: int):
     """Downscale img to fit within max_w×max_h; return (scaled_img, scale_factor)."""
     h, w = img.shape[:2]
@@ -97,7 +118,9 @@ def recompute_from_corners(corners: np.ndarray):
     compute the homography mapping court-space → pixel-space and project
     all 16 OUTPUT_IDX points.  Returns list of (x, y) tuples or None.
     """
-    H, _ = cv2.findHomography(CORNER_COURT_PTS, corners)
+    src_points = np.asarray(CORNER_COURT_PTS, dtype=np.float32)
+    dst_points = np.asarray(corners, dtype=np.float32)
+    H, _ = cv2.findHomography(src_points, dst_points)
     if H is None:
         return None
     pts = []

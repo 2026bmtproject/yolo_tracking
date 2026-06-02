@@ -1,10 +1,14 @@
 from pathlib import Path
+import csv
 import subprocess
 import sys
+from typing import Any
 
 import cv2
 import numpy as np
 from ultralytics import YOLO
+
+from court_select import load_outer_corners_from_csv
 
 
 # =============================================================================
@@ -35,12 +39,18 @@ MODEL_PATH = "yolo26m-pose.pt"
 RUN_MODE = "single"
 
 # single 模式使用。
-VIDEO_SOURCE = Path("testvid/test1.mp4")
-OUTPUT_PATH = Path("runs/player_only/testvid_test1.mp4")
+VIDEO_SOURCE = Path("test.mp4")
+OUTPUT_PATH = Path("runs/player_only/test.mp4")
 
 # folder 模式使用。
 INPUT_DIR = Path("andersclip")
 OUTPUT_DIR = Path("anders_fina_track")
+
+# 輸出模式：
+# "video"：只輸出處理後的影片。
+# "csv"：只輸出骨架資料 CSV。
+# "both"：兩者都輸出。
+OUTPUT_MODE = "both"
 
 # 是否先開啟 court_select.py 讓你手動標球場。
 # True：執行時會開啟標點工具。
@@ -70,24 +80,6 @@ TRACKER = "badminton_tracker.yaml"
 # =============================================================================
 COURT_SELECT_SCRIPT = Path("court_select.py")
 COURT_SELECT_OUTPUT_PATH = Path("runs/player_only/selected_court.csv")
-
-# 若 USE_COURT_SELECT = False，可改成 True 讓程式用第一幀自動估測球場。
-# 自動估測容易受影片色調影響，不穩時建議手動標定。
-AUTO_DETECT_COURT = False
-SAVE_COURT_DEBUG_IMAGE = True
-COURT_DEBUG_DIR = Path("runs/court_debug")
-
-# 自動估測球場用的 HSV 綠色遮罩範圍。
-COURT_HSV_LOWER = np.array([35, 35, 35], dtype=np.uint8)
-COURT_HSV_UPPER = np.array([95, 255, 255], dtype=np.uint8)
-COURT_TOP_IGNORE_RATIO = 0.32
-MIN_COURT_AREA_RATIO = 0.06
-AUTO_COURT_REFINE_TO_LINES = True
-AUTO_COURT_TOP_INSET_RATIO = 0.035
-AUTO_COURT_BOTTOM_LEFT_INSET_RATIO = 0.07
-AUTO_COURT_BOTTOM_RIGHT_INSET_RATIO = 0.09
-AUTO_COURT_TOP_Y_OFFSET_RATIO = 0.005
-AUTO_COURT_BOTTOM_Y_OFFSET_RATIO = 0.045
 
 # 手動球場四角座標，順序固定為：左上、右上、左下、右下。
 COURT_POLYGON = np.array(
@@ -150,6 +142,83 @@ COCO_POSE_PAIRS = (
     (2, 4),
 )
 
+KEYPOINT_COUNT = 17
+
+
+def output_mode_flags() -> tuple[bool, bool]:
+    if OUTPUT_MODE == "video":
+        return True, False
+    if OUTPUT_MODE == "csv":
+        return False, True
+    if OUTPUT_MODE == "both":
+        return True, True
+    raise ValueError('OUTPUT_MODE must be "video", "csv", or "both"')
+
+
+def skeleton_csv_fieldnames() -> list[str]:
+    fieldnames = [
+        "video_name",
+        "frame_index",
+        "player_side",
+        "track_id",
+        "recovered",
+        "detected_side",
+        "score",
+        "box_x1",
+        "box_y1",
+        "box_x2",
+        "box_y2",
+        "point_x",
+        "point_y",
+        "court_distance",
+    ]
+
+    for index in range(1, KEYPOINT_COUNT + 1):
+        fieldnames.extend(
+            [
+                f"keypoint_{index}_x",
+                f"keypoint_{index}_y",
+                f"keypoint_{index}_conf",
+            ]
+        )
+
+    return fieldnames
+
+
+def player_to_csv_row(video_name: str, frame_index: int, player: dict) -> dict:
+    box = player["box"]
+    keypoints = player.get("keypoints")
+    row = {
+        "video_name": video_name,
+        "frame_index": frame_index,
+        "player_side": player["side"],
+        "track_id": player.get("track_id"),
+        "recovered": bool(player.get("recovered", False)),
+        "detected_side": player.get("detected_side"),
+        "score": player.get("score"),
+        "box_x1": float(box[0]),
+        "box_y1": float(box[1]),
+        "box_x2": float(box[2]),
+        "box_y2": float(box[3]),
+        "point_x": float(player["point"][0]),
+        "point_y": float(player["point"][1]),
+        "court_distance": float(player.get("court_distance", 0.0)),
+    }
+
+    if keypoints is None:
+        for index in range(1, KEYPOINT_COUNT + 1):
+            row[f"keypoint_{index}_x"] = None
+            row[f"keypoint_{index}_y"] = None
+            row[f"keypoint_{index}_conf"] = None
+        return row
+
+    for index, (x, y, confidence) in enumerate(keypoints, start=1):
+        row[f"keypoint_{index}_x"] = float(x)
+        row[f"keypoint_{index}_y"] = float(y)
+        row[f"keypoint_{index}_conf"] = float(confidence)
+
+    return row
+
 
 def detection_point(box_xyxy: np.ndarray, keypoints_xy_conf: np.ndarray | None) -> tuple[float, float]:
     """Use ankle midpoint when visible; otherwise use the bottom-center of the box."""
@@ -167,181 +236,17 @@ def detection_point(box_xyxy: np.ndarray, keypoints_xy_conf: np.ndarray | None) 
     return float((x1 + x2) / 2), float(y2)
 
 
-def order_polygon_points(points: np.ndarray) -> np.ndarray:
-    points = points.astype(np.float32)
-    sums = points.sum(axis=1)
-    diffs = points[:, 0] - points[:, 1]
-    return np.array(
-        [
-            points[np.argmin(sums)],
-            points[np.argmax(diffs)],
-            points[np.argmin(diffs)],
-            points[np.argmax(sums)],
-        ],
-        dtype=np.int32,
-    )
-
-
 def court_polygon_for_cv(court_polygon: np.ndarray | None = None) -> np.ndarray:
     """Convert TL, TR, BL, BR into OpenCV contour order: TL, TR, BR, BL."""
     polygon = COURT_POLYGON if court_polygon is None else court_polygon
     return polygon[[0, 1, 3, 2]].astype(np.int32)
 
 
-def court_polygon_from_contour(contour: np.ndarray) -> np.ndarray | None:
-    points = contour.reshape(-1, 2)
-    if len(points) < 4:
-        return None
-
-    min_y = int(points[:, 1].min())
-    max_y = int(points[:, 1].max())
-    height = max(1, max_y - min_y)
-    top_band = points[points[:, 1] <= min_y + height * 0.28]
-    bottom_band = points[points[:, 1] >= max_y - height * 0.18]
-
-    if len(top_band) < 2 or len(bottom_band) < 2:
-        rect = cv2.minAreaRect(contour)
-        box = cv2.boxPoints(rect)
-        return order_polygon_points(box)
-
-    top_left = top_band[np.argmin(top_band[:, 0])]
-    top_right = top_band[np.argmax(top_band[:, 0])]
-    bottom_left = bottom_band[np.argmin(bottom_band[:, 0])]
-    bottom_right = bottom_band[np.argmax(bottom_band[:, 0])]
-    return np.array([top_left, top_right, bottom_left, bottom_right], dtype=np.int32)
-
-
-def refine_court_surface_to_line_polygon(surface_polygon: np.ndarray, frame_shape: tuple[int, ...]) -> np.ndarray:
-    if not AUTO_COURT_REFINE_TO_LINES:
-        return surface_polygon.astype(np.int32)
-
-    frame_height, frame_width = frame_shape[:2]
-    polygon = surface_polygon.astype(np.float32).copy()
-
-    top_y = max(polygon[0, 1], polygon[1, 1]) + frame_height * AUTO_COURT_TOP_Y_OFFSET_RATIO
-    bottom_y = min(polygon[2, 1], polygon[3, 1]) - frame_height * AUTO_COURT_BOTTOM_Y_OFFSET_RATIO
-
-    polygon[0, 0] += frame_width * AUTO_COURT_TOP_INSET_RATIO
-    polygon[1, 0] -= frame_width * AUTO_COURT_TOP_INSET_RATIO
-    polygon[2, 0] += frame_width * AUTO_COURT_BOTTOM_LEFT_INSET_RATIO
-    polygon[3, 0] -= frame_width * AUTO_COURT_BOTTOM_RIGHT_INSET_RATIO
-
-    polygon[0, 1] = top_y
-    polygon[1, 1] = top_y
-    polygon[2, 1] = bottom_y
-    polygon[3, 1] = bottom_y
-    return polygon.astype(np.int32)
-
-
-def detect_court_polygon_from_frame(frame: np.ndarray) -> np.ndarray | None:
-    frame_height, frame_width = frame.shape[:2]
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, COURT_HSV_LOWER, COURT_HSV_UPPER)
-
-    # 上方常有綠色廣告板，先忽略畫面上方，避免把廣告當成球場。
-    mask[: int(frame_height * COURT_TOP_IGNORE_RATIO), :] = 0
-
-    kernel = np.ones((9, 9), dtype=np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-
-    min_area = frame_width * frame_height * MIN_COURT_AREA_RATIO
-    contours = [contour for contour in contours if cv2.contourArea(contour) >= min_area]
-    if not contours:
-        return None
-
-    contour = max(contours, key=cv2.contourArea)
-    hull = cv2.convexHull(contour)
-    polygon = court_polygon_from_contour(hull)
-    if polygon is None:
-        return None
-
-    polygon_area = abs(cv2.contourArea(court_polygon_for_cv(polygon).astype(np.float32)))
-    if polygon_area < min_area:
-        return None
-
-    top_width = np.linalg.norm(polygon[1] - polygon[0])
-    bottom_width = np.linalg.norm(polygon[3] - polygon[2])
-    if top_width < frame_width * 0.15 or bottom_width < frame_width * 0.25:
-        return None
-
-    return refine_court_surface_to_line_polygon(polygon, frame.shape)
-
-
-def save_court_debug_image(video_source: Path, frame: np.ndarray, polygon: np.ndarray, auto_detected: bool) -> None:
-    if not SAVE_COURT_DEBUG_IMAGE:
-        return
-
-    COURT_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
-    debug_image = frame.copy()
-    color = (0, 255, 255) if auto_detected else (0, 0, 255)
-    cv2.polylines(debug_image, [court_polygon_for_cv(polygon)], True, color, 3)
-    label = "auto court" if auto_detected else "fallback court"
-    cv2.putText(
-        debug_image,
-        label,
-        (30, 60),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1.4,
-        color,
-        3,
-        cv2.LINE_AA,
-    )
-    cv2.imwrite(str(COURT_DEBUG_DIR / f"{video_source.stem}_court.jpg"), debug_image)
-
-
-def update_court_polygon_for_video(video_source: Path) -> None:
-    global COURT_POLYGON, COURT_CENTER_Y
-
-    if not AUTO_DETECT_COURT or USE_COURT_SELECT:
-        return
-
-    capture = cv2.VideoCapture(str(video_source))
-    ok, frame = capture.read()
-    capture.release()
-    if not ok:
-        print(f"court auto-detect skipped: could not read first frame from {video_source}")
-        return
-
-    detected_polygon = detect_court_polygon_from_frame(frame)
-    if detected_polygon is None:
-        COURT_POLYGON = MANUAL_COURT_POLYGON.copy()
-        COURT_CENTER_Y = float(COURT_POLYGON[:, 1].mean())
-        print(f"court auto-detect failed, using manual COURT_POLYGON: {video_source.name}")
-        save_court_debug_image(video_source, frame, COURT_POLYGON, auto_detected=False)
-        return
-
-    COURT_POLYGON = detected_polygon
-    COURT_CENTER_Y = float(COURT_POLYGON[:, 1].mean())
-    print(f"court auto-detected for {video_source.name}: {COURT_POLYGON.tolist()}")
-    save_court_debug_image(video_source, frame, COURT_POLYGON, auto_detected=True)
-
-
-def parse_court_select_point(line: str) -> list[float]:
-    parts = [part.strip() for part in line.replace(",", ";").split(";") if part.strip()]
-    if len(parts) < 2:
-        raise ValueError(f"Invalid court_select point line: {line!r}")
-    return [float(parts[0]), float(parts[1])]
-
-
-def load_court_polygon_from_select_csv(csv_path: Path) -> np.ndarray:
-    with csv_path.open("r", encoding="utf-8-sig") as file:
-        points = [parse_court_select_point(line) for line in file if line.strip()]
-
-    if len(points) < 4:
-        raise ValueError(f"{csv_path} must contain at least 4 court points")
-
-    return np.array(points[:4], dtype=np.int32)
-
-
-def set_court_polygon(court_polygon: np.ndarray, source: str) -> None:
+def set_court_polygon(court_points: np.ndarray, source: str) -> None:
     global COURT_POLYGON, COURT_CENTER_Y, MANUAL_COURT_POLYGON
 
-    COURT_POLYGON = court_polygon.astype(np.int32)
+    polygon = np.asarray(court_points, dtype=np.int32)
+    COURT_POLYGON = polygon
     MANUAL_COURT_POLYGON = COURT_POLYGON.copy()
     COURT_CENTER_Y = float(COURT_POLYGON[:, 1].mean())
     print(f"court polygon loaded from {source}: {COURT_POLYGON.tolist()}")
@@ -386,7 +291,7 @@ def setup_court_polygon_with_court_select() -> None:
     else:
         print(f"using existing court_select csv: {court_csv_path}")
 
-    court_polygon = load_court_polygon_from_select_csv(court_csv_path)
+    court_polygon = load_outer_corners_from_csv(court_csv_path)
     set_court_polygon(court_polygon, str(court_csv_path))
 
 
@@ -431,7 +336,7 @@ def player_score(
     center_distance = np.linalg.norm(np.array(point) - court_center)
     outside_penalty = max(0.0, -court_distance)
     track_bonus = 100000.0 if recently_selected else 0.0
-    return area + track_bonus - center_distance * 20.0 - outside_penalty * 80.0
+    return float(area + track_bonus - center_distance * 20.0 - outside_penalty * 80.0)
 
 
 def court_side(point: tuple[float, float]) -> str:
@@ -509,14 +414,16 @@ class PlayerSelector:
             self._forget_old_tracks()
             return []
 
-        boxes = result.boxes.xyxy.cpu().numpy()
+        boxes_raw: Any = result.boxes.xyxy
+        boxes = boxes_raw.cpu().numpy()
         track_ids = None
         if result.boxes.id is not None:
             track_ids = result.boxes.id.cpu().numpy().astype(int)
 
         keypoints = None
         if result.keypoints is not None and result.keypoints.data is not None:
-            keypoints = result.keypoints.data.cpu().numpy()
+            keypoints_raw: Any = result.keypoints.data
+            keypoints = keypoints_raw.cpu().numpy()
 
         candidates = []
         for index, box in enumerate(boxes):
@@ -534,7 +441,9 @@ class PlayerSelector:
 
             if near_court or recently_selected or matched_recent_player:
                 detected_side = court_side(point)
-                side = recent_track["side"] if recently_selected else court_side(point)
+                side = detected_side
+                if recently_selected and recent_track is not None:
+                    side = recent_track["side"]
                 candidates.append(
                     {
                         "base_score": player_score(box, point, court_distance, recently_selected),
@@ -542,8 +451,10 @@ class PlayerSelector:
                         "track_id": track_id,
                         "box": box,
                         "point": point,
+                        "keypoints": kpts,
                         "side": side,
                         "detected_side": detected_side,
+                        "court_distance": court_distance,
                     }
                 )
 
@@ -725,10 +636,12 @@ def recover_player_from_crop(
     if result.boxes is None or len(result.boxes) == 0:
         return None
 
-    boxes = result.boxes.xyxy.cpu().numpy()
+    boxes_raw: Any = result.boxes.xyxy
+    boxes = boxes_raw.cpu().numpy()
     keypoints = None
     if result.keypoints is not None and result.keypoints.data is not None:
-        keypoints = result.keypoints.data.cpu().numpy()
+        keypoints_raw: Any = result.keypoints.data
+        keypoints = keypoints_raw.cpu().numpy()
 
     best_candidate = None
     best_score = float("-inf")
@@ -759,6 +672,7 @@ def recover_player_from_crop(
                 "point": point,
                 "side": side,
                 "keypoints": kpts,
+                "court_distance": court_distance,
                 "recovered": True,
             }
 
@@ -793,6 +707,22 @@ def output_path_for_video(video_path: Path) -> Path:
     return OUTPUT_DIR / f"{video_path.stem}_player_only.mp4"
 
 
+def csv_path_for_video(video_path: Path) -> Path:
+    return OUTPUT_DIR / f"{video_path.stem}_player_only.csv"
+
+
+def output_paths_for_video(video_path: Path) -> tuple[Path | None, Path | None]:
+    save_video, save_csv = output_mode_flags()
+    video_output = output_path_for_video(video_path) if save_video else None
+    csv_output = csv_path_for_video(video_path) if save_csv else None
+    if RUN_MODE == "single":
+        if video_output is not None:
+            video_output = OUTPUT_PATH
+        if csv_output is not None:
+            csv_output = OUTPUT_PATH.with_suffix(".csv")
+    return video_output, csv_output
+
+
 def video_files(input_dir: Path) -> list[Path]:
     return sorted(
         path
@@ -818,9 +748,13 @@ def print_progress(video_name: str, current_frame: int, total_frames: int) -> No
     sys.stdout.flush()
 
 
-def process_video(model: YOLO, crop_model: YOLO, video_source: Path, output_path: Path) -> int:
-    update_court_polygon_for_video(video_source)
-
+def process_video(
+    model: YOLO,
+    crop_model: YOLO,
+    video_source: Path,
+    output_video_path: Path | None,
+    output_csv_path: Path | None,
+) -> int:
     source_capture = cv2.VideoCapture(str(video_source))
     fps = source_capture.get(cv2.CAP_PROP_FPS) or 30
     width = int(source_capture.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -832,13 +766,27 @@ def process_video(model: YOLO, crop_model: YOLO, video_source: Path, output_path
         print(f"skipped unreadable video: {video_source}")
         return 0
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    writer = cv2.VideoWriter(
-        str(output_path),
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        fps,
-        (width, height),
-    )
+    save_video = output_video_path is not None
+    save_csv = output_csv_path is not None
+
+    writer = None
+    if save_video:
+        output_video_path.parent.mkdir(parents=True, exist_ok=True)
+        fourcc = getattr(cv2, "VideoWriter_fourcc")(*"mp4v")
+        writer = cv2.VideoWriter(
+            str(output_video_path),
+            fourcc,
+            fps,
+            (width, height),
+        )
+
+    csv_file = None
+    csv_writer = None
+    if save_csv:
+        output_csv_path.parent.mkdir(parents=True, exist_ok=True)
+        csv_file = output_csv_path.open("w", newline="", encoding="utf-8-sig")
+        csv_writer = csv.DictWriter(csv_file, fieldnames=skeleton_csv_fieldnames())
+        csv_writer.writeheader()
 
     results = model.track(
         source=str(video_source),
@@ -855,45 +803,70 @@ def process_video(model: YOLO, crop_model: YOLO, video_source: Path, output_path
     recovered_frame_count = 0
     processed_frame_count = 0
 
-    for processed_frame_count, result in enumerate(results, start=1):
-        players = player_selector.selected_players(result)
-        players = recover_missing_players(crop_model, result.orig_img, player_selector, players)
-        keep = [player["index"] for player in players if player["index"] is not None]
-        annotated = result[keep].plot(labels=False, conf=False) if keep else result.orig_img.copy()
+    try:
+        for processed_frame_count, result in enumerate(results, start=1):
+            players = player_selector.selected_players(result)
+            players = recover_missing_players(crop_model, result.orig_img, player_selector, players)
+            keep = [player["index"] for player in players if player["index"] is not None]
 
-        for player in players:
-            if player.get("recovered") and player.get("keypoints") is not None:
-                recovered_frame_count += 1
-                draw_pose(annotated, player["box"], player["keypoints"])
-            draw_player_label(annotated, player["box"], PLAYER_LABELS[player["side"]])
+            if save_video:
+                annotated = result[keep].plot(labels=False, conf=False) if keep else result.orig_img.copy()
 
-        if DRAW_COURT_ROI:
-            cv2.polylines(annotated, [court_polygon_for_cv()], True, (0, 255, 255), 2)
+                for player in players:
+                    if player.get("recovered") and player.get("keypoints") is not None:
+                        recovered_frame_count += 1
+                        draw_pose(annotated, player["box"], player["keypoints"])
+                    draw_player_label(annotated, player["box"], PLAYER_LABELS[player["side"]])
 
-        writer.write(annotated)
+                if DRAW_COURT_ROI:
+                    cv2.polylines(annotated, [court_polygon_for_cv()], True, (0, 255, 255), 2)
 
-        should_update_progress = (
-            processed_frame_count == 1
-            or processed_frame_count % PROGRESS_UPDATE_FRAMES == 0
-            or processed_frame_count == total_frames
-        )
-        if should_update_progress:
+                video_writer: Any = writer
+                assert video_writer is not None
+                video_writer.write(annotated)
+
+            else:
+                for player in players:
+                    if player.get("recovered") and player.get("keypoints") is not None:
+                        recovered_frame_count += 1
+
+            if save_csv and csv_writer is not None:
+                for player in players:
+                    csv_writer.writerow(player_to_csv_row(video_source.name, processed_frame_count, player))
+
+            should_update_progress = (
+                processed_frame_count == 1
+                or processed_frame_count % PROGRESS_UPDATE_FRAMES == 0
+                or processed_frame_count == total_frames
+            )
+            if should_update_progress:
+                print_progress(video_source.name, processed_frame_count, total_frames)
+
+        if processed_frame_count:
             print_progress(video_source.name, processed_frame_count, total_frames)
+            print()
+    finally:
+        if writer is not None:
+            writer.release()
+        if csv_file is not None:
+            csv_file.close()
 
-    if processed_frame_count:
-        print_progress(video_source.name, processed_frame_count, total_frames)
-        print()
-
-    writer.release()
-    print(f"saved: {output_path}")
+    if save_video:
+        print(f"saved video: {output_video_path}")
+    if save_csv:
+        print(f"saved csv: {output_csv_path}")
     print(f"crop recovery used: {recovered_frame_count} player frames")
     return recovered_frame_count
 
 
 def process_single_video(model: YOLO, crop_model: YOLO) -> None:
     print(f"processing single video: {VIDEO_SOURCE}")
-    recovered_count = process_video(model, crop_model, VIDEO_SOURCE, OUTPUT_PATH)
-    print(f"done: saved to {OUTPUT_PATH}")
+    output_video_path, output_csv_path = output_paths_for_video(VIDEO_SOURCE)
+    recovered_count = process_video(model, crop_model, VIDEO_SOURCE, output_video_path, output_csv_path)
+    if output_video_path is not None:
+        print(f"done: saved to {output_video_path}")
+    if output_csv_path is not None:
+        print(f"done: saved to {output_csv_path}")
     print(f"total crop recovery used: {recovered_count} player frames")
 
 
@@ -907,18 +880,30 @@ def process_video_folder(model: YOLO, crop_model: YOLO) -> None:
     total_recovered = 0
 
     for index, video_source in enumerate(videos, start=1):
-        output_path = output_path_for_video(video_source)
+        output_video_path, output_csv_path = output_paths_for_video(video_source)
         print(f"\nfolder progress: {index}/{len(videos)} videos")
         print(f"processing: {video_source.name}")
-        total_recovered += process_video(model, crop_model, video_source, output_path)
+        total_recovered += process_video(
+            model,
+            crop_model,
+            video_source,
+            output_video_path,
+            output_csv_path,
+        )
 
-    print(f"done: {len(videos)} videos saved to {OUTPUT_DIR}")
+    if output_mode_flags()[0]:
+        print(f"done: {len(videos)} videos saved to {OUTPUT_DIR}")
+    if output_mode_flags()[1]:
+        print(f"done: {len(videos)} csv files saved to {OUTPUT_DIR}")
     print(f"total crop recovery used: {total_recovered} player frames")
 
 
 def validate_settings() -> None:
     if RUN_MODE not in {"single", "folder"}:
         raise ValueError('RUN_MODE must be "single" or "folder"')
+
+    if OUTPUT_MODE not in {"video", "csv", "both"}:
+        raise ValueError('OUTPUT_MODE must be "video", "csv", or "both"')
 
     if not Path(MODEL_PATH).exists():
         raise FileNotFoundError(f"MODEL_PATH not found: {MODEL_PATH}")
